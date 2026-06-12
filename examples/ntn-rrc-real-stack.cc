@@ -1,15 +1,22 @@
 /* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
-// Copyright (c) 2026 Muhammad Uzair
-// SPDX-License-Identifier: GPL-2.0-only
-//
-// ntn-rrc-leo-pass — ephemeris-driven Timing Advance + SIB19 (TS 38.331
-// NTN-Config) on a REAL mmwave NR NTN cell (NtnRealStackHelper: SpectrumPhy +
-// MAC + HARQ + RLC/PDCP + RRC + EPC). The TA total/common/UE-specific values and
-// the TA drift rate are taken from the live LEO-pass geometry (the classic NTN
-// "smile" curve), SIB19 is re-broadcast from the live ephemeris, and the RRC
-// connection-quality measurement report fires on the MEASURED DL SINR off the
-// mmwave RxPacketTraceUe trace — no closed-form SINR anywhere. Writes a TA/SINR
-// trace CSV and an honest sim_health.csv (phy-trace provenance).
+/*
+ * Copyright (c) 2026  Muhammad Uzair
+ * SPDX-License-Identifier: GPL-2.0-only
+ *
+ * ntn-rrc-real-stack — real-stack flagship for ntn-rrc.
+ *
+ * The real RRC NTN machinery (NtnTimingAdvance + NtnSib19Broadcaster, TS 38.331
+ * NTN-Config) sits on a REAL mmwave NR NTN cell (NtnRealStackHelper: SpectrumPhy
+ * + MAC + HARQ + RLC/PDCP + RRC + EPC). The serving satellite flies a LEO pass,
+ * so the TA total/common/UE-specific and the TA drift come from the real
+ * slant-range geometry (the classic NTN "smile" curve), and the RRC
+ * connection-quality measurement report is the MEASURED DL SINR off the mmwave
+ * PHY trace (GetUeRecentSinrDb) — not a formula. SIB19 is re-broadcast every
+ * si-period from the live ephemeris while packets actually traverse the radio.
+ *
+ * Usage:
+ *   ./ns3 run "ntn-rrc-real-stack --duration=20 --numUes=4"
+ */
 
 #include "ns3/core-module.h"
 #include "ns3/mmwave-enb-net-device.h"
@@ -33,7 +40,7 @@
 using namespace ns3;
 using namespace ns3::ntnrrc;
 
-NS_LOG_COMPONENT_DEFINE("NtnRrcLeoPass");
+NS_LOG_COMPONENT_DEFINE("NtnRrcRealStack");
 
 namespace
 {
@@ -94,16 +101,16 @@ Sample()
 int
 main(int argc, char* argv[])
 {
-    double simTime = 20.0;
+    double duration = 20.0;
     uint32_t numUes = 4;
     double altitudeKm = 550.0;
     double satEirpDbm = 55.0;
     double freqGhz = 2.0;
     bool transparent = true;
-    std::string outputDir = "ntn-rrc-leo-pass-output";
+    std::string outputDir = "ntn-rrc-real-stack-output";
 
     CommandLine cmd(__FILE__);
-    cmd.AddValue("simTime", "Simulation duration (s)", simTime);
+    cmd.AddValue("duration", "Simulation duration (s)", duration);
     cmd.AddValue("numUes", "Number of UEs on the serving cell", numUes);
     cmd.AddValue("altitude", "Satellite altitude (km)", altitudeKm);
     cmd.AddValue("satEirpDbm", "Satellite EIRP / gNB Tx power (dBm)", satEirpDbm);
@@ -111,13 +118,13 @@ main(int argc, char* argv[])
     cmd.AddValue("transparent", "Transparent (true) vs regenerative (false) payload", transparent);
     cmd.AddValue("outputDir", "Output directory", outputDir);
     cmd.Parse(argc, argv);
-    g_simTime = simTime;
+    g_simTime = duration;
 
-    std::cout << "\n=== ntn-rrc-leo-pass (SIB19 + TA on a real mmwave NR NTN cell) ===\n"
+    std::cout << "\n=== ntn-rrc REAL-STACK (SIB19 + TA on a real mmwave NR NTN cell) ===\n"
               << "  serving cell: real mmwave NR link, " << numUes << " UEs\n"
-              << "  TA + SIB19 ephemeris: live LEO-pass geometry (TS 38.331 NTN-Config)\n"
+              << "  TA + SIB19 ephemeris: from live LEO-pass geometry (TS 38.331 NTN-Config)\n"
               << "  RRC measurement trigger: MEASURED DL SINR (not a formula)\n"
-              << "  duration: " << simTime << " s\n\n";
+              << "  duration: " << duration << " s\n\n";
 
     NodeContainer satNodes;
     satNodes.Create(1);
@@ -148,38 +155,37 @@ main(int argc, char* argv[])
     Ptr<MobilityModel> ueMob = ueModels[0];
 
     NtnRealStackHelper rs;
-    rs.SetSimTime(Seconds(simTime));
+    rs.SetSimTime(Seconds(duration));
     rs.SetOutputDir(outputDir);
-    rs.SetRunTag("ntn-rrc-leo-pass");
+    rs.SetRunTag("ntn-rrc-real-stack");
     rs.SetCarrierFrequencyHz(freqGhz * 1e9);
     rs.SetSatEirpDbm(satEirpDbm);
     rs.Build(satNodes, ueNodes);
     rs.InstallTraffic(NtnRealStackHelper::TrafficProfile::EmbbStreaming,
-                      Seconds(1.0), Seconds(simTime - 0.5));
-    rs.EnableAiFlowMonitor("ntn-rrc-leo-pass"); // WS2 KPM series (TS 28.552 names)
+                      Seconds(1.0), Seconds(duration - 0.5));
+    rs.EnableAiFlowMonitor("ntn-rrc-real-stack"); // WS2 KPM series (TS 28.552 names)
     g_rs = &rs;
 
     NtnRrcHelper rrc;
     rrc.SetPayloadMode(transparent ? PayloadMode::Transparent : PayloadMode::RegenerativeFull);
+    // TA reference = beam centre at the sub-point (ECEF), per TS 38.331.
     rrc.SetReferencePosition(ntngeo::GeodeticToEcef(subLat, subLon, 0.0));
     g_ta = rrc.InstallTimingAdvance(ueMob, satMob);
 
     Ptr<mmwave::MmWaveEnbNetDevice> enb =
         DynamicCast<mmwave::MmWaveEnbNetDevice>(rs.GetEnbDevices().Get(0));
-    const uint16_t cellId = enb ? enb->GetCellId() : 1;
+    uint16_t cellId = enb ? enb->GetCellId() : 1;
     g_sib = rrc.InstallSib19Broadcaster(satMob, cellId, g_ta, MilliSeconds(160));
     g_sib->Start();
 
     std::filesystem::create_directories(outputDir);
-    g_csv.open(outputDir + "/ntn-rrc-leo-pass-ta.csv");
+    g_csv.open(outputDir + "/ntn-rrc-real-stack-ta.csv");
     g_csv << "time_s,slant_km,ta_total_us,ta_common_us,ta_ue_us,ta_drift_us_per_s,"
              "measured_sinr_db\n";
 
-    // The serving satellite flies its REAL SGP4 pass: the slant range, TA and
-    // measured SINR all evolve with genuine orbital dynamics (no teleports).
     Simulator::Schedule(Seconds(1.0), &Sample);
 
-    Simulator::Stop(Seconds(simTime));
+    Simulator::Stop(Seconds(duration));
     Simulator::Run();
     rs.Collect();
     rs.WriteHealthReport();
@@ -188,17 +194,17 @@ main(int argc, char* argv[])
         g_csv.close();
     }
 
+    const Time finalTa = g_ta->ComputeTotalTa();
     std::cout << "\n--- RRC Summary (real SIB19/TA on MEASURED radio) ---\n"
               << "  measured serving SINR (mean): " << rs.GetMeanDlSinrDb() << " dB\n"
               << "  measured DL throughput:       " << rs.GetRxThroughputMbps() << " Mbps\n"
               << "  final slant range:            " << g_ta->GetSlantRangeMetres() / 1000.0
               << " km\n"
-              << "  final total TA:               " << g_ta->ComputeTotalTa().GetMicroSeconds()
-              << " us\n"
+              << "  final total TA:               " << finalTa.GetMicroSeconds() << " us\n"
               << "  SIB19 ephemeris refreshes:    " << g_sib19Refresh << "\n"
               << "  RRC measurement reports:      " << g_measReports
-              << "  (on MEASURED SINR < " << g_measThreshDb << " dB)\n"
-              << "  TA/SINR trace:                " << outputDir << "/ntn-rrc-leo-pass-ta.csv\n";
+              << "  (triggered on MEASURED SINR < " << g_measThreshDb << " dB)\n"
+              << "  TA/SINR trace:                " << outputDir << "/ntn-rrc-real-stack-ta.csv\n";
 
     Simulator::Destroy();
     return 0;
