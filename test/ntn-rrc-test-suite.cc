@@ -71,12 +71,15 @@ class NtnTimingAdvanceClosedFormTest : public TestCase
     }
 };
 
-/// Regenerative payload halves the TA (single-leg).
+/// Regenerative TA is the round-trip service-link delay (2 d / c). Timing
+/// Advance always compensates the round trip; the gNB simply sits on the
+/// satellite, so the UE<->gNB round trip is the service link 2 d / c (the
+/// earlier "single-leg" value under-compensated the uplink by 2x).
 class NtnTimingAdvanceRegenerativeTest : public TestCase
 {
   public:
     NtnTimingAdvanceRegenerativeTest()
-        : TestCase("Regenerative payload halves the TA vs transparent")
+        : TestCase("Regenerative TA is the round-trip service-link 2 d / c")
     {
     }
 
@@ -88,9 +91,9 @@ class NtnTimingAdvanceRegenerativeTest : public TestCase
         Ptr<NtnTimingAdvance> ta =
             helper.InstallTimingAdvance(MakeStaticMob(Vector{0, 0, 0}),
                                         MakeStaticMob(Vector{0, 0, 550e3}));
-        const double expectedSeconds = 550e3 / kC; // single leg
+        const double expectedSeconds = 2.0 * 550e3 / kC; // round trip
         NS_TEST_ASSERT_MSG_EQ_TOL(ta->ComputeTotalTa().GetSeconds(), expectedSeconds, 1e-8,
-                                  "Regenerative TA != d / c");
+                                  "Regenerative TA != 2 d / c");
     }
 };
 
@@ -179,6 +182,48 @@ class NtnTimingAdvanceDriftRateTest : public TestCase
         // TR 38.821 §6.3.3: TA drift rate at LEO nadir is essentially 0 (purely
         // tangential motion); off-nadir bounds at <50 µs/s.
         NS_TEST_EXPECT_MSG_LT(drift, 50e-6, "Drift rate too large for LEO");
+    }
+};
+
+/// Regression for the regenerative-mode drift bug (audit CRITICAL #7): drift was
+/// (d/c - 2d/c)/dt ~= -0.18 s/s at LEO for RegenerativeFull regardless of
+/// geometry, because t0 used 2d/c but t1 used 1d/c. With the fix (t1 = 2d/c) the
+/// regenerative drift must equal the transparent drift and stay < 25 µs/s.
+class NtnTimingAdvanceRegenerativeDriftRateTest : public TestCase
+{
+  public:
+    NtnTimingAdvanceRegenerativeDriftRateTest()
+        : TestCase("Regenerative TA drift rate is bounded under 25 us per s")
+    {
+    }
+
+  private:
+    void DoRun() override
+    {
+        // Same geometry as the transparent test but RegenerativeFull payload.
+        const Vector sat{0, 0, kEarthRadiusMetres + 550e3};
+        const Vector satV{7590.0, 0.0, 0.0};
+
+        NtnRrcHelper regen;
+        regen.SetPayloadMode(PayloadMode::RegenerativeFull);
+        Ptr<NtnTimingAdvance> taRegen =
+            regen.InstallTimingAdvance(MakeStaticMob(Vector{0, 0, 0}),
+                                       MakeMovingMob(sat, satV));
+        const double driftRegen = std::abs(taRegen->ComputeTaDriftRate(MilliSeconds(10)));
+
+        // Must be physically bounded — NOT the ~0.18 s/s the old branch produced.
+        NS_TEST_ASSERT_MSG_LT(driftRegen, 25e-6,
+                              "Regenerative drift too large (got " << driftRegen << ")");
+
+        // Payload mode must not change the drift: TA_total is 2d/c either way.
+        NtnRrcHelper trans;
+        trans.SetPayloadMode(PayloadMode::Transparent);
+        Ptr<NtnTimingAdvance> taTrans =
+            trans.InstallTimingAdvance(MakeStaticMob(Vector{0, 0, 0}),
+                                       MakeMovingMob(sat, satV));
+        const double driftTrans = std::abs(taTrans->ComputeTaDriftRate(MilliSeconds(10)));
+        NS_TEST_ASSERT_MSG_EQ_TOL(driftRegen, driftTrans, 1e-12,
+                                  "Regenerative and transparent drift must match");
     }
 };
 
@@ -278,6 +323,58 @@ class Sib19CodecRejectsTruncatedTest : public TestCase
         NS_TEST_ASSERT_MSG_EQ(Sib19Codec::Parse(shortBuf.data(), shortBuf.size(), sib),
                               false,
                               "Parse must reject a truncated buffer");
+    }
+};
+
+/// GAP R3 (CI gate 14, population half): SIB19 must broadcast a NON-ZERO
+/// cellSpecificKoffset / kMac derived from the common TA, covering the cell
+/// round trip (TS 38.213 §4.2). Before the fix these were hard 0 on the wire.
+class Sib19KOffsetPopulatedTest : public TestCase
+{
+  public:
+    Sib19KOffsetPopulatedTest()
+        : TestCase("SIB19 cellSpecificKoffset is derived from the common TA (R3)")
+    {
+    }
+
+  private:
+    void DoRun() override
+    {
+        // Satellite at 600 km straight overhead -> common TA (RTT) = 2*600km/c
+        // = 4.0028 ms. At numerology 1 (0.5 ms slot) K_offset = ceil(4.0028/0.5)
+        // + 1 = 9 slots.
+        Ptr<ConstantVelocityMobilityModel> sat = CreateObject<ConstantVelocityMobilityModel>();
+        sat->SetPosition(Vector{0.0, 0.0, 600e3});
+        sat->SetVelocity(Vector{0.0, 0.0, 0.0});
+
+        NtnRrcHelper helper;
+        helper.SetPayloadMode(PayloadMode::Transparent);
+        helper.SetReferencePosition(Vector{0, 0, 0});
+        Ptr<NtnTimingAdvance> ta = helper.InstallTimingAdvance(MakeStaticMob(Vector{0, 0, 0}), sat);
+
+        Ptr<NtnSib19Broadcaster> bc = CreateObject<NtnSib19Broadcaster>();
+        bc->SetSatelliteMobility(sat);
+        bc->SetTimingAdvance(ta);
+        bc->SetReferencePosition(Vector{0, 0, 0});
+        bc->SetCellId(7);
+        bc->SetNumerology(1); // 30 kHz SCS -> 0.5 ms slot
+        bc->SetPeriod(MilliSeconds(160));
+        bc->Start();
+        Simulator::Stop(MilliSeconds(10));
+        Simulator::Run();
+
+        const auto& sib = bc->GetLatest();
+        const double c = 299792458.0;
+        const double rttS = 2.0 * 600e3 / c;
+        const double slotS = 0.5e-3;
+        const uint32_t expected = static_cast<uint32_t>(std::ceil(rttS / slotS)) + 1;
+
+        NS_TEST_ASSERT_MSG_NE(sib.cellSpecificKoffset, 0u,
+                              "K_offset must not be 0 on the wire (R3)");
+        NS_TEST_ASSERT_MSG_EQ(sib.cellSpecificKoffset, expected,
+                              "K_offset must cover the common-TA round trip in slots");
+        NS_TEST_ASSERT_MSG_EQ(sib.kMac, expected, "kMac must match K_offset coverage");
+        Simulator::Destroy();
     }
 };
 
@@ -638,6 +735,7 @@ class NtnRrcTestSuite : public TestSuite
         AddTestCase(new NtnTimingAdvance38821ReferenceTest, TestCase::Duration::QUICK);
         AddTestCase(new NtnTimingAdvanceCommonAndUeSpecificTest, TestCase::Duration::QUICK);
         AddTestCase(new NtnTimingAdvanceDriftRateTest, TestCase::Duration::QUICK);
+        AddTestCase(new NtnTimingAdvanceRegenerativeDriftRateTest, TestCase::Duration::QUICK);
         AddTestCase(new Sib19CodecRoundTripTest, TestCase::Duration::QUICK);
         AddTestCase(new Sib19CodecRejectsTruncatedTest, TestCase::Duration::QUICK);
         AddTestCase(new Sib19BroadcasterTickTest, TestCase::Duration::QUICK);
@@ -649,6 +747,7 @@ class NtnRrcTestSuite : public TestSuite
         AddTestCase(new DrxDataActivityTest, TestCase::Duration::QUICK);
         AddTestCase(new DrxPassAwareTest, TestCase::Duration::QUICK);
         AddTestCase(new DrxInvalidConfigTest, TestCase::Duration::QUICK);
+        AddTestCase(new Sib19KOffsetPopulatedTest, TestCase::Duration::QUICK);
     }
 };
 
