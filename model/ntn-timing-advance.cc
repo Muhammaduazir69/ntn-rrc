@@ -4,6 +4,8 @@
 
 #include "ntn-timing-advance.h"
 
+#include <iostream>
+
 #include <ns3/log.h>
 #include <ns3/mobility-model.h>
 #include <ns3/simulator.h>
@@ -72,11 +74,78 @@ NtnTimingAdvance::GetFeederRangeMetres() const
 {
     // Zero when the payload terminates on board (the gNB is the satellite, so
     // there is no feeder leg in the timing loop) or when no gateway was given.
+    //
+    // RRC-2b: the second case used to be silent, and it is not the same thing as
+    // the first. A Transparent payload genuinely HAS a feeder leg; returning
+    // zero because nobody supplied the gateway makes the advance identical to
+    // regenerative and the payload-mode distinction inert. SetGatewayMobility
+    // had no caller outside the unit tests, so every shipped scenario in
+    // Transparent mode was quietly under-compensating: measured on
+    // ntn-rrc-real-stack, 3789 us either way, against 7717 us once the gateway
+    // is supplied. Warn once rather than let it pass for a result.
+    if (m_payloadMode == PayloadMode::Transparent && m_sat && !m_gw)
+    {
+        static bool warned = false;
+        if (!warned)
+        {
+            warned = true;
+            // std::cerr, not NS_LOG_WARN: the logging macros are compiled out
+            // of ns-3 optimized builds, which is how every example in this tree
+            // is run, so a warning behind NS_LOG would never have been seen by
+            // the people it is for.
+            std::cerr << "[ntn-rrc/RRC-2b] Transparent payload with no gateway mobility. The "
+                         "feeder leg is omitted, so this timing advance covers the service link "
+                         "only and reports what a REGENERATIVE payload would. Call "
+                         "NtnRrcHelper::SetGatewayMobility() to include it.\n";
+        }
+    }
     if (m_payloadMode != PayloadMode::Transparent || !m_gw || !m_sat)
     {
         return 0.0;
     }
     return CalculateDistance(m_gw->GetPosition(), m_sat->GetPosition());
+}
+
+void
+NtnTimingAdvance::SetSatelliteStateProvider(SatStateProvider provider)
+{
+    m_satState = provider;
+}
+
+Vector
+NtnTimingAdvance::GetSatellitePositionAt(Time offset) const
+{
+    NS_ASSERT_MSG(m_sat, "Satellite mobility must be set");
+    if (!m_satState.IsNull())
+    {
+        Vector p;
+        Vector v;
+        m_satState(offset, p, v);
+        return p;
+    }
+    const Vector p = m_sat->GetPosition();
+    const Vector v = m_sat->GetVelocity();
+    const double t = offset.GetSeconds();
+    return Vector(p.x + v.x * t, p.y + v.y * t, p.z + v.z * t);
+}
+
+NtnTimingAdvance::DelayDerivatives
+NtnTimingAdvance::ComputeDelayDerivatives(const Vector& point, Time offset, Time h) const
+{
+    // Five-point stencils: O(h^4) for the first two derivatives, O(h^2) for the third.
+    const double s = h.GetSeconds();
+    double f[5];
+    for (int k = -2; k <= 2; ++k)
+    {
+        const Vector p = GetSatellitePositionAt(offset + Seconds(k * s));
+        f[k + 2] = 2.0 * CalculateDistance(p, point) / kSpeedOfLight;
+    }
+    DelayDerivatives d;
+    d.ta = f[2];
+    d.d1 = (f[0] - 8.0 * f[1] + 8.0 * f[3] - f[4]) / (12.0 * s);
+    d.d2 = (-f[0] + 16.0 * f[1] - 30.0 * f[2] + 16.0 * f[3] - f[4]) / (12.0 * s * s);
+    d.d3 = (-f[0] + 2.0 * f[1] - 2.0 * f[3] + f[4]) / (2.0 * s * s * s);
+    return d;
 }
 
 double
@@ -181,12 +250,21 @@ NtnTimingAdvance::ComputeTaDriftRate(Time eps) const
     const Vector ue1{ue0.x + ueV.x * dt, ue0.y + ueV.y * dt, ue0.z + ueV.z * dt};
     const Vector sat1{sat0.x + satV.x * dt, sat0.y + satV.y * dt, sat0.z + satV.z * dt};
     const double d1 = CalculateDistance(ue1, sat1);
-    // TA_total is the round-trip service-link delay (2*d/c) for BOTH payload
-    // modes — see ComputeTotalTa(). t0 above already uses 2*d/c, so t1 must too;
-    // a mode-dependent multiplier here made regenerative drift ~= (d/c - 2d/c)/dt
-    // ~= -0.18 s/s at LEO regardless of geometry (poisoning SIB19
-    // taCommonDriftRate). Use 2.0 unconditionally to match ComputeTotalTa().
-    const Time t1 = Seconds(2.0 * d1 / kSpeedOfLight);
+
+    // RRC-8 (2026-09-18): t0 and t1 must cover the SAME path.
+    //
+    // ComputeTotalTa() spans the service link plus, in Transparent mode, the
+    // gateway feeder leg. This projection used only the service slant, so with
+    // a gateway attached the difference carried a spurious -2*feeder/c term and
+    // the reported drift was wrong by a constant far larger than the drift
+    // itself. The feeder endpoint is fixed on the ground while the satellite
+    // moves, so the feeder leg is projected with the satellite as well.
+    double feeder1 = 0.0;
+    if (m_payloadMode == PayloadMode::Transparent && m_gw)
+    {
+        feeder1 = CalculateDistance(sat1, m_gw->GetPosition());
+    }
+    const Time t1 = Seconds(2.0 * (d1 + feeder1) / kSpeedOfLight);
     const double dTa = (t1 - t0).GetSeconds();
     return (dt > 0.0) ? (dTa / dt) : 0.0;
 }
