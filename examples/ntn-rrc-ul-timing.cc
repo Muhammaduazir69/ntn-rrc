@@ -612,7 +612,8 @@ main(int argc, char* argv[])
         Ptr<NrGnbNetDevice> gnb = DynamicCast<NrGnbNetDevice>(gnbNodes.Get(0)->GetDevice(d));
         if (gnb)
         {
-            gnb->GetPhy(0)->GetSpectrumPhy()->TraceConnectWithoutContext(
+            // The PUSCH arrives on the UL BWP (BWP 1 under paired FDD).
+            gnb->GetPhy(rs.GetUlBwpIndex())->GetSpectrumPhy()->TraceConnectWithoutContext(
                 "RxPacketTraceGnb",
                 MakeCallback(&UlTbStats::Rx, &ulTb));
         }
@@ -745,7 +746,10 @@ main(int argc, char* argv[])
               << " pusch_sinr_db=" << ulTb.MeanSinrDb()
               << " pusch_mean_rb=" << (ulTb.tbs ? static_cast<double>(ulTb.sumRb) / ulTb.tbs : 0.0)
               << " pusch_mean_mcs="
-              << (ulTb.tbs ? static_cast<double>(ulTb.sumMcs) / ulTb.tbs : 0.0) << "\n"
+              << (ulTb.tbs ? static_cast<double>(ulTb.sumMcs) / ulTb.tbs : 0.0)
+              << " ul_pc=" << (rs.IsUlPowerHeadroomPrbLimitActive() ? 1 : 0)
+              << " p0_dbm=" << rs.GetUlP0NominalPuschDbm() << " phr_sent=" << rs.GetPhrSentCount()
+              << " phr_rx=" << rs.GetPhrReceivedCount() << "\n"
               << "dataplane outputs in " << outputDir << "\n";
     sibTx->Close();
     sibRx->Close();
